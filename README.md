@@ -17,8 +17,8 @@ School21 kompyuterlarida shaxsiy akkountingizni vaqtincha auto-lockdan himoya qi
 ### 1. Reponi clone qiling
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/gost-lockscreen.git
-cd gost-lockscreen
+git clone https://github.com/SuxrobSadullayev/ghost-lockscreen.git
+cd ghost-lockscreen
 ```
 
 ### 2. Installerni ishga tushiring
