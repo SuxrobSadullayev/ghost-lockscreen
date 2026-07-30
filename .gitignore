@@ -1,0 +1,4 @@
+# Personal log files (generated at runtime)
+*.log
+.lockscreen_timer
+.lockscreen_restore.sh

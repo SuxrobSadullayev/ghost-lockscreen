@@ -1,0 +1,303 @@
+#!/bin/bash
+
+# ============================================================
+# lockscreen - School21 auto-lock bypass tool
+# Usage:
+#   lockscreen 6h       -> disable auto-lock for 6 hours
+#   lockscreen 30m      -> disable auto-lock for 30 minutes
+#   lockscreen off      -> immediately restore auto-lock
+#   lockscreen status   -> show current status
+# ============================================================
+
+TIMER_FILE="$HOME/.lockscreen_timer"
+RESTORE_SCRIPT="$HOME/.lockscreen_restore.sh"
+LOG_FILE="$HOME/.lockscreen.log"
+
+# Default idle timeout in seconds (30 minutes = 1800)
+DEFAULT_IDLE_DELAY=1800
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# Parse time argument: 6h -> 21600 seconds, 30m -> 1800 seconds
+parse_time() {
+    local input="$1"
+    local value="${input%[hHmMsS]}"
+    local unit="${input: -1}"
+
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: Invalid time format. Use: 6h, 30m, 3600s"
+        exit 1
+    fi
+
+    case "$unit" in
+        h|H) echo $((value * 3600)) ;;
+        m|M) echo $((value * 60)) ;;
+        s|S) echo "$value" ;;
+        *)   echo "ERROR: Unknown time unit '$unit'. Use h, m, or s."
+             exit 1 ;;
+    esac
+}
+
+# Ensure DISPLAY and DBUS are set (needed when called from cron/background)
+ensure_display() {
+    if [ -z "$DISPLAY" ]; then
+        export DISPLAY=":0"
+    fi
+    if [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+    fi
+}
+
+# Detect which screen lock system is in use
+detect_lock_system() {
+    ensure_display
+    if command -v gsettings &>/dev/null && gsettings get org.gnome.desktop.session idle-delay &>/dev/null 2>&1; then
+        echo "gnome"
+    elif command -v xset &>/dev/null; then
+        echo "xset"
+    else
+        echo "unknown"
+    fi
+}
+
+# Get current idle delay
+get_current_delay() {
+    local system="$1"
+    case "$system" in
+        gnome)
+            gsettings get org.gnome.desktop.session idle-delay 2>/dev/null | grep -o '[0-9]*' || echo "1800"
+            ;;
+        xset)
+            xset q 2>/dev/null | grep "timeout:" | awk '{print $2}' || echo "1800"
+            ;;
+        *)
+            echo "1800"
+            ;;
+    esac
+}
+
+# Disable auto-lock
+disable_lock() {
+    local system="$1"
+    ensure_display
+    case "$system" in
+        gnome)
+            gsettings set org.gnome.desktop.session idle-delay 0
+            gsettings set org.gnome.desktop.screensaver lock-enabled false
+            # Disable power management screen sleep
+            gsettings set org.gnome.settings-daemon.plugins.power sleep-display-ac 0 2>/dev/null || true
+            gsettings set org.gnome.settings-daemon.plugins.power sleep-display-battery 0 2>/dev/null || true
+            ;;
+        xset)
+            xset s off
+            xset -dpms
+            xset s 0 0
+            ;;
+        unknown)
+            echo "WARNING: Could not detect lock system. Trying both methods..."
+            xset s off 2>/dev/null || true
+            xset -dpms 2>/dev/null || true
+            ;;
+    esac
+    log "Auto-lock DISABLED (system: $system)"
+}
+
+# Enable auto-lock (restore default)
+enable_lock() {
+    local system="$1"
+    local delay="${2:-$DEFAULT_IDLE_DELAY}"
+    ensure_display
+    case "$system" in
+        gnome)
+            gsettings set org.gnome.desktop.session idle-delay "$delay"
+            gsettings set org.gnome.desktop.screensaver lock-enabled true
+            ;;
+        xset)
+            xset s "$delay" "$delay"
+            xset +dpms
+            xset dpms "$delay" "$((delay + 60))" "$((delay + 120))"
+            ;;
+        unknown)
+            xset s "$delay" "$delay" 2>/dev/null || true
+            xset +dpms 2>/dev/null || true
+            ;;
+    esac
+    log "Auto-lock ENABLED (delay: ${delay}s, system: $system)"
+}
+
+# Kill any existing restore timer
+kill_existing_timer() {
+    if [ -f "$TIMER_FILE" ]; then
+        local old_pid
+        old_pid=$(cat "$TIMER_FILE" 2>/dev/null)
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            kill "$old_pid" 2>/dev/null
+            log "Killed existing timer (PID: $old_pid)"
+        fi
+        rm -f "$TIMER_FILE"
+    fi
+    rm -f "$RESTORE_SCRIPT"
+}
+
+# Create restore script that runs after the timer expires
+create_restore_script() {
+    local system="$1"
+    local delay="$2"
+    local uid
+    uid=$(id -u)
+
+    cat > "$RESTORE_SCRIPT" << RESTORE_EOF
+#!/bin/bash
+export DISPLAY=":0"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus"
+
+case "${system}" in
+    gnome)
+        gsettings set org.gnome.desktop.session idle-delay "${delay}"
+        gsettings set org.gnome.desktop.screensaver lock-enabled true
+        ;;
+    xset)
+        xset s "${delay}" "${delay}"
+        xset +dpms
+        xset dpms "${delay}" "$((delay + 60))" "$((delay + 120))"
+        ;;
+esac
+
+echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Auto-lock RESTORED (delay: ${delay}s)" >> "${LOG_FILE}"
+notify-send "lockscreen" "Auto-lock restored. Idle timeout: 30 min" 2>/dev/null || true
+rm -f "${TIMER_FILE}"
+RESTORE_EOF
+    chmod +x "$RESTORE_SCRIPT"
+}
+
+# Show current status
+show_status() {
+    local system
+    system=$(detect_lock_system)
+
+    echo "=== lockscreen status ==="
+    echo "Lock system: $system"
+
+    if [ -f "$TIMER_FILE" ]; then
+        local pid
+        pid=$(cat "$TIMER_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "Status: DISABLED  (auto-lock is OFF, timer running — PID: $pid)"
+        else
+            echo "Status: UNKNOWN   (timer file exists but process not running)"
+            rm -f "$TIMER_FILE"
+        fi
+    else
+        echo "Status: NORMAL    (auto-lock is active)"
+    fi
+
+    echo ""
+    echo "Current settings:"
+    case "$system" in
+        gnome)
+            echo "  idle-delay   : $(gsettings get org.gnome.desktop.session idle-delay 2>/dev/null)"
+            echo "  lock-enabled : $(gsettings get org.gnome.desktop.screensaver lock-enabled 2>/dev/null)"
+            ;;
+        xset)
+            xset q 2>/dev/null | grep -A3 "Screen Saver" || echo "  xset info unavailable"
+            ;;
+    esac
+
+    if [ -f "$LOG_FILE" ]; then
+        echo ""
+        echo "Last 5 log entries:"
+        tail -5 "$LOG_FILE"
+    fi
+}
+
+# ─── MAIN ────────────────────────────────────────────────────────────────────
+
+if [ $# -eq 0 ]; then
+    echo "Usage:"
+    echo "  lockscreen 6h       - disable auto-lock for 6 hours"
+    echo "  lockscreen 90m      - disable auto-lock for 90 minutes"
+    echo "  lockscreen off      - immediately restore auto-lock"
+    echo "  lockscreen status   - show current status"
+    exit 0
+fi
+
+ARG="$1"
+
+case "$ARG" in
+    off|OFF|restore|RESTORE)
+        echo "Restoring auto-lock..."
+        LOCK_SYSTEM=$(detect_lock_system)
+        kill_existing_timer
+        enable_lock "$LOCK_SYSTEM" "$DEFAULT_IDLE_DELAY"
+        echo "✓ Done. Auto-lock restored (30 min idle timeout)."
+        notify-send "lockscreen" "Auto-lock restored." 2>/dev/null || true
+        ;;
+
+    status|STATUS)
+        show_status
+        ;;
+
+    *)
+        # Parse as time duration
+        SECONDS_DURATION=$(parse_time "$ARG")
+        if [[ "$SECONDS_DURATION" == ERROR* ]]; then
+            echo "$SECONDS_DURATION"
+            exit 1
+        fi
+
+        LOCK_SYSTEM=$(detect_lock_system)
+        CURRENT_DELAY=$(get_current_delay "$LOCK_SYSTEM")
+
+        # Kill any existing timer first
+        kill_existing_timer
+
+        # Save current delay as restore target (fallback to 30 min)
+        if [ "$CURRENT_DELAY" -gt 0 ] 2>/dev/null; then
+            RESTORE_DELAY="$CURRENT_DELAY"
+        else
+            RESTORE_DELAY="$DEFAULT_IDLE_DELAY"
+        fi
+
+        # Disable auto-lock right now
+        disable_lock "$LOCK_SYSTEM"
+
+        # Create the restore script
+        create_restore_script "$LOCK_SYSTEM" "$RESTORE_DELAY"
+
+        # Start background timer
+        (
+            sleep "$SECONDS_DURATION"
+            bash "$RESTORE_SCRIPT"
+        ) &
+        TIMER_PID=$!
+        echo "$TIMER_PID" > "$TIMER_FILE"
+        disown "$TIMER_PID"
+
+        # Human-readable duration
+        if [ "$SECONDS_DURATION" -ge 3600 ]; then
+            H=$((SECONDS_DURATION / 3600))
+            M=$((SECONDS_DURATION % 3600 / 60))
+            if [ "$M" -gt 0 ]; then
+                HUMAN_TIME="${H}h ${M}m"
+            else
+                HUMAN_TIME="${H}h"
+            fi
+        else
+            HUMAN_TIME="$((SECONDS_DURATION / 60))m"
+        fi
+
+        RESTORE_TIME=$(date -d "+${SECONDS_DURATION} seconds" '+%H:%M' 2>/dev/null || echo "after $HUMAN_TIME")
+
+        echo "✓ Auto-lock DISABLED for $HUMAN_TIME"
+        echo "  Restores at  : $RESTORE_TIME"
+        echo "  Lock system  : $LOCK_SYSTEM"
+        echo "  Timer PID    : $TIMER_PID"
+        echo ""
+        echo "  To cancel early: lockscreen off"
+
+        notify-send "lockscreen" "Auto-lock disabled for $HUMAN_TIME. Restores at $RESTORE_TIME." 2>/dev/null || true
+        log "Disabled for ${SECONDS_DURATION}s (restores at $RESTORE_TIME), PID: $TIMER_PID"
+        ;;
+esac
