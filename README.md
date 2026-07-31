@@ -1,14 +1,51 @@
-# lockscreen — School21 Auto-Lock Bypass Tool
+# 🔒 lockscreen — School21 Auto-Lock Bypass Tool
 
-School21 kompyuterlarida shaxsiy akkountingizni vaqtincha auto-lockdan himoya qiluvchi tool.
+> School21 kompyuterlarida shaxsiy akkountingiz avtomatik chiqarib yuborilmasligi uchun CLI tool.
 
 ---
 
-## Qanday ishlaydi
+## Muammo nima?
 
-- `lockscreen 6h` — 6 soat davomida akkount avtomatik chiqarib yubormaydigan bo'ladi
-- 6 soat tugagach, tizim o'zi avvalgi holatiga (30 daqiqa) qaytadi
-- `lockscreen off` — istalgan vaqtda qo'lda qaytarish
+School21 kompyuterlarida har bir akkount **30 daqiqa** faolsizlikdan so'ng avtomatik ravishda lock bo'lib, foydalanuvchi tizimdan chiqarib yuboriladi. Agar siz uzoqroq vaqt ish bilan band bo'lsangiz (masalan, compile kutayotgan bo'lsangiz, yoki bir joyga ketib kelishingiz kerak bo'lsa), akkountingiz sessiyan yo'qoladi.
+
+Bu tool o'sha muammoni hal qiladi.
+
+---
+
+## Qanday ishlaydi?
+
+```
+┌─────────────────────────────────────────────────────┐
+│  lockscreen 6h                                      │
+│                                                     │
+│  1. GNOME idle-delay → 0  (lock o'chadi)            │
+│  2. Fon timer → sleep 21600s                        │
+│  3. 6 soat o'tgach → sozlamalar qaytariladi         │
+│  4. Auto-lock yana 30 daqiqaga qaytadi              │
+└─────────────────────────────────────────────────────┘
+```
+
+### Ichki mexanizm — qadamma-qadam
+
+1. **`lockscreen Nh` yoziladi** — script ishga tushadi
+2. **Lock tizimi aniqlanadi** — GNOME yoki xset borligini tekshiradi
+3. **Joriy sozlamalar saqlanadi** — asl idle-delay qaytarish uchun yodda tutiladi
+4. **Auto-lock o'chiriladi:**
+   - GNOME: `gsettings set org.gnome.desktop.session idle-delay 0`
+   - GNOME: `gsettings set org.gnome.desktop.screensaver lock-enabled false`
+   - xset: `xset s off` va `xset -dpms`
+5. **Fon jarayoni (timer) ishga tushadi** — `sleep N` orqali kutadi, `disown` bilan terminaldan ajratiladi
+6. **Timer tugagach** — `~/.lockscreen_restore.sh` ishga tushadi va barcha sozlamalar avvalgi holatga qaytariladi
+7. **Bildirishnoma keladi** — `notify-send` orqali ekranda xabar ko'rinadi
+
+### Fayllar
+
+| Fayl | Joylashuv | Maqsad |
+|---|---|---|
+| `lockscreen` | `~/.local/bin/lockscreen` | Asosiy executable script |
+| `.lockscreen_timer` | `~/.lockscreen_timer` | Timer jarayonining PID i |
+| `.lockscreen_restore.sh` | `~/.lockscreen_restore.sh` | Vaqt tugaganda ishlaydigan restore script |
+| `.lockscreen.log` | `~/.lockscreen.log` | Barcha amallar logi |
 
 ---
 
@@ -42,58 +79,115 @@ source ~/.zshrc
 lockscreen status
 ```
 
+> **Eslatma:** `install.sh` faqat **bir marta** ishga tushiriladi. Keyingi sessiyalarda to'g'ridan-to'g'ri `lockscreen` buyrug'ini ishlatasiz.
+
 ---
 
 ## Ishlatish
 
+### Asosiy buyruqlar
+
 ```bash
-# 6 soat uchun auto-lockni o'chirish
-lockscreen 6h
+lockscreen 6h        # 6 soat
+lockscreen 10h       # 10 soat
+lockscreen 30m       # 30 daqiqa
+lockscreen 90m       # 1 soat 30 daqiqa
+lockscreen 150m      # 2 soat 30 daqiqa
+lockscreen 8h        # 8 soat (to'liq ish kuni)
+lockscreen off       # Vaqtidan oldin qaytarish
+lockscreen status    # Joriy holatni ko'rish
+```
 
-# 90 daqiqa uchun
-lockscreen 90m
+### Vaqt formatlari
 
-# 2 soat 30 daqiqa uchun (minutlarda yozing)
-lockscreen 150m
+| Format | Misol | Hisob |
+|--------|-------|-------|
+| `h` — soat | `lockscreen 10h` | 10 × 3600 = 36000 soniya |
+| `m` — daqiqa | `lockscreen 45m` | 45 × 60 = 2700 soniya |
+| `s` — soniya | `lockscreen 3600s` | 3600 soniya |
 
-# Holatni ko'rish
-lockscreen status
+### Status chiqishi misoli
 
-# Vaqtidan oldin qaytarish
-lockscreen off
+```
+=== lockscreen status ===
+Lock system: gnome
+Status: DISABLED  (auto-lock is OFF, timer running — PID: 12345)
+
+Current settings:
+  idle-delay   : uint32 0
+  lock-enabled : false
+
+Last 5 log entries:
+[2025-01-15 09:00:01] Auto-lock DISABLED (system: gnome)
+[2025-01-15 09:00:01] Disabled for 36000s (restores at 19:00), PID: 12345
 ```
 
 ---
 
-## Qo'llab-quvvatlanadigan vaqt formatlari
+## Ish oqimi (misol)
 
-| Format | Misol | Ma'nosi |
-|--------|-------|---------|
-| `h`    | `6h`  | 6 soat  |
-| `m`    | `90m` | 90 daqiqa |
-| `s`    | `3600s` | 3600 soniya |
+```bash
+# Ertalab School21 ga keldingiz, ish boshladingiz
+lockscreen 8h
+# ✓ Auto-lock DISABLED for 8h
+# Restores at : 18:00
+# Lock system : gnome
+# Timer PID   : 9821
+#
+# To cancel early: lockscreen off
+
+# ... 8 soat ishlaysiz, tizim sizni chiqarmaydi ...
+
+# Kechqurun ketishdan oldin (ixtiyoriy — o'zi qaytadi)
+lockscreen off
+# ✓ Done. Auto-lock restored (30 min idle timeout).
+```
 
 ---
 
-## Qanday ishlaydi (texnik)
+## Qo'shimcha
 
-1. GNOME yoki xset orqali idle-delay ni `0` ga qo'yadi (lock o'chadi)
-2. Fon jarayoni (`sleep N`) ishga tushadi
-3. Vaqt tugagach, `~/.lockscreen_restore.sh` ishga tushadi va sozlamalarni qaytaradi
-4. Timer PID `~/.lockscreen_timer` faylida saqlanadi
-
----
-
-## Log fayl
+### Log faylni ko'rish
 
 ```bash
 cat ~/.lockscreen.log
 ```
 
+### Agar tool ishlamay qolsa
+
+```bash
+# Qo'lda sozlamalarni qaytarish (GNOME uchun)
+gsettings set org.gnome.desktop.session idle-delay 1800
+gsettings set org.gnome.desktop.screensaver lock-enabled true
+
+# xset uchun
+xset s 1800 1800
+xset +dpms
+```
+
+### Timer jarayonini tekshirish
+
+```bash
+cat ~/.lockscreen_timer        # PID ni ko'rish
+ps aux | grep $(cat ~/.lockscreen_timer)  # jarayon ishlayaptimi
+```
+
 ---
 
-## Eslatma
+## Texnik talablar
 
-- Bu tool faqat **o'zingizning akkountingiz** uchun ishlaydi
-- Tizim sozlamalarini o'zgartirmaydi, faqat GNOME/xset user sozlamalarini boshqaradi
-- School21 kompyuterlarida har sessiyada qaytadan o'rnatish **shart emas** — bir marta `install.sh` ishlatsangiz kifoya (`~/.local/bin/` da saqlanadi)
+- Linux (Ubuntu/Debian) — School21 kompyuterlari
+- Bash 4+
+- GNOME Desktop yoki xset mavjud bo'lsa ishlaydi
+- Alohida o'rnatish talab qilinmaydi (`gsettings` va `xset` o'rnatilgan bo'ladi)
+
+---
+
+## Loyiha tuzilmasi
+
+```
+ghost-lockscreen/
+├── lockscreen      # Asosiy script
+├── install.sh      # Bir martalik o'rnatuvchi
+└── README.md       # Ushbu fayl
+```
