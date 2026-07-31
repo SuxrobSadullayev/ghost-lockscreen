@@ -1,16 +1,25 @@
 #!/bin/bash
 
 # ============================================================
-# lockscreen - School21 auto-lock bypass tool
+# lockscreen - School21 session-keep-alive tool
 # Usage:
-#   lockscreen 6h       -> disable auto-lock for 6 hours
-#   lockscreen 30m      -> disable auto-lock for 30 minutes
-#   lockscreen off      -> immediately restore auto-lock
+#   lockscreen 6h       -> lock screen now, keep session alive 6h
+#   lockscreen 30m      -> lock screen now, keep session alive 30 min
+#   lockscreen off      -> cancel timer, restore settings
 #   lockscreen status   -> show current status
+#   lockscreen dry-run 6h -> show what would happen (no side effects)
+#
+# Problem: School21 auto-logs out the session after 30 min idle
+# (systemd-logind IdleActionSec). Even a locked screen is "idle"
+# for logind, so the session dies while you are away.
+# Solution: register an idle inhibitor (systemd-inhibit) so logind
+# never considers the session idle, then lock the screen.
 # ============================================================
 
 TIMER_FILE="$HOME/.lockscreen_timer"
+INHIBITOR_FILE="$HOME/.lockscreen_inhibitor_pid"
 RESTORE_SCRIPT="$HOME/.lockscreen_restore.sh"
+SETTINGS_FILE="$HOME/.lockscreen_settings"
 LOG_FILE="$HOME/.lockscreen.log"
 
 # Default idle timeout in seconds (30 minutes = 1800)
@@ -40,6 +49,22 @@ parse_time() {
     esac
 }
 
+# Human-readable duration: 21600 -> "6h", 5400 -> "1h 30m"
+human_time() {
+    local seconds="$1"
+    if [ "$seconds" -ge 3600 ]; then
+        local h=$((seconds / 3600))
+        local m=$((seconds % 3600 / 60))
+        if [ "$m" -gt 0 ]; then
+            echo "${h}h ${m}m"
+        else
+            echo "${h}h"
+        fi
+    else
+        echo "$((seconds / 60))m"
+    fi
+}
+
 # Ensure DISPLAY and DBUS are set (needed when called from cron/background)
 ensure_display() {
     if [ -z "$DISPLAY" ]; then
@@ -67,7 +92,7 @@ get_current_delay() {
     local system="$1"
     case "$system" in
         gnome)
-            gsettings get org.gnome.desktop.session idle-delay 2>/dev/null | grep -o '[0-9]*' || echo "1800"
+            gsettings get org.gnome.desktop.session idle-delay 2>/dev/null | awk '{print $NF}' | grep -E '^[0-9]+$' || echo "1800"
             ;;
         xset)
             xset q 2>/dev/null | grep "timeout:" | awk '{print $2}' || echo "1800"
@@ -78,7 +103,43 @@ get_current_delay() {
     esac
 }
 
-# Disable auto-lock
+# Save current settings to ~/.lockscreen_settings for later restore
+save_settings() {
+    local system="$1"
+    : > "$SETTINGS_FILE"
+    case "$system" in
+        gnome)
+            echo "idle_delay=$(get_current_delay gnome)" >> "$SETTINGS_FILE"
+            echo "lock_enabled=$(gsettings get org.gnome.desktop.screensaver lock-enabled 2>/dev/null | tr -d "'" || echo true)" >> "$SETTINGS_FILE"
+            ;;
+        xset)
+            echo "xset_timeout=$(get_current_delay xset)" >> "$SETTINGS_FILE"
+            ;;
+    esac
+    log "Settings saved (system: $system)"
+}
+
+# Restore settings from ~/.lockscreen_settings
+restore_settings() {
+    local system="$1"
+    [ -f "$SETTINGS_FILE" ] || return 0
+    local idle_delay lock_enabled xset_timeout
+    idle_delay=$(grep '^idle_delay=' "$SETTINGS_FILE" | cut -d= -f2)
+    lock_enabled=$(grep '^lock_enabled=' "$SETTINGS_FILE" | cut -d= -f2)
+    xset_timeout=$(grep '^xset_timeout=' "$SETTINGS_FILE" | cut -d= -f2)
+    case "$system" in
+        gnome)
+            [ -n "$idle_delay" ] && gsettings set org.gnome.desktop.session idle-delay "$idle_delay"
+            gsettings set org.gnome.desktop.screensaver lock-enabled "${lock_enabled:-true}"
+            ;;
+        xset)
+            [ -n "$xset_timeout" ] && { xset s "$xset_timeout" "$xset_timeout"; xset +dpms; }
+            ;;
+    esac
+    log "Settings restored (system: $system)"
+}
+
+# Fallback method (no systemd-inhibit): disable auto-lock via gsettings/xset
 disable_lock() {
     local system="$1"
     ensure_display
@@ -86,7 +147,6 @@ disable_lock() {
         gnome)
             gsettings set org.gnome.desktop.session idle-delay 0
             gsettings set org.gnome.desktop.screensaver lock-enabled false
-            # Disable power management screen sleep
             gsettings set org.gnome.settings-daemon.plugins.power sleep-display-ac 0 2>/dev/null || true
             gsettings set org.gnome.settings-daemon.plugins.power sleep-display-battery 0 2>/dev/null || true
             ;;
@@ -96,55 +156,69 @@ disable_lock() {
             xset s 0 0
             ;;
         unknown)
-            echo "WARNING: Could not detect lock system. Trying both methods..."
             xset s off 2>/dev/null || true
             xset -dpms 2>/dev/null || true
             ;;
     esac
-    log "Auto-lock DISABLED (system: $system)"
+    log "Fallback: auto-lock DISABLED (system: $system)"
 }
 
-# Enable auto-lock (restore default)
-enable_lock() {
-    local system="$1"
-    local delay="${2:-$DEFAULT_IDLE_DELAY}"
+# Start the idle inhibitor: blocks logind from treating the session
+# as idle, so the 30-min auto-logout never triggers. No root needed.
+start_inhibitor() {
+    local seconds="$1"
+    if ! command -v systemd-inhibit &>/dev/null; then
+        echo "WARNING: systemd-inhibit not found — using fallback (gsettings/xset disable)."
+        echo "  This will NOT protect a locked session on School21."
+        return 1
+    fi
+    nohup systemd-inhibit --what=idle --mode=block --why="lockscreen timer" sleep "$seconds" >/dev/null 2>&1 &
+    echo $! > "$INHIBITOR_FILE"
+    log "Idle inhibitor started (PID: $(cat "$INHIBITOR_FILE"))"
+    return 0
+}
+
+# Lock the screen immediately
+lock_screen() {
     ensure_display
-    case "$system" in
-        gnome)
-            gsettings set org.gnome.desktop.session idle-delay "$delay"
-            gsettings set org.gnome.desktop.screensaver lock-enabled true
-            ;;
-        xset)
-            xset s "$delay" "$delay"
-            xset +dpms
-            xset dpms "$delay" "$((delay + 60))" "$((delay + 120))"
-            ;;
-        unknown)
-            xset s "$delay" "$delay" 2>/dev/null || true
-            xset +dpms 2>/dev/null || true
-            ;;
-    esac
-    log "Auto-lock ENABLED (delay: ${delay}s, system: $system)"
+    local sid
+    sid=$(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$USER" '$3==u && $6=="user" {print $1; exit}')
+    if [ -n "$sid" ] && loginctl lock-session "$sid" 2>/dev/null; then
+        echo "Screen locked (loginctl, session: $sid)"
+        return 0
+    fi
+    if command -v gdbus &>/dev/null && gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.Lock &>/dev/null; then
+        echo "Screen locked (gdbus GNOME ScreenSaver)"
+        return 0
+    fi
+    if command -v gnome-screensaver-command &>/dev/null && gnome-screensaver-command -l 2>/dev/null; then
+        echo "Screen locked (gnome-screensaver-command)"
+        return 0
+    fi
+    echo "WARNING: could not lock the screen — lock it manually (Super+L)."
+    return 1
 }
 
-# Kill any existing restore timer
+# Kill any existing timer + inhibitor from a previous run
 kill_existing_timer() {
+    local pid
     if [ -f "$TIMER_FILE" ]; then
-        local old_pid
-        old_pid=$(cat "$TIMER_FILE" 2>/dev/null)
-        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-            kill "$old_pid" 2>/dev/null
-            log "Killed existing timer (PID: $old_pid)"
-        fi
+        pid=$(cat "$TIMER_FILE" 2>/dev/null)
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null
         rm -f "$TIMER_FILE"
     fi
+    if [ -f "$INHIBITOR_FILE" ]; then
+        pid=$(cat "$INHIBITOR_FILE" 2>/dev/null)
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+        rm -f "$INHIBITOR_FILE"
+    fi
     rm -f "$RESTORE_SCRIPT"
+    log "Old timer/inhibitor cleaned"
 }
 
-# Create restore script that runs after the timer expires
+# Create the restore script that runs when the timer expires
 create_restore_script() {
     local system="$1"
-    local delay="$2"
     local uid
     uid=$(id -u)
 
@@ -153,21 +227,28 @@ create_restore_script() {
 export DISPLAY=":0"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus"
 
+if [ -f "${INHIBITOR_FILE}" ]; then
+    IPID=\$(cat "${INHIBITOR_FILE}" 2>/dev/null)
+    [ -n "\$IPID" ] && kill "\$IPID" 2>/dev/null
+    rm -f "${INHIBITOR_FILE}"
+fi
+
 case "${system}" in
     gnome)
-        gsettings set org.gnome.desktop.session idle-delay "${delay}"
-        gsettings set org.gnome.desktop.screensaver lock-enabled true
+        IDLE=\$(grep '^idle_delay=' "${SETTINGS_FILE}" 2>/dev/null | cut -d= -f2)
+        LOCK=\$(grep '^lock_enabled=' "${SETTINGS_FILE}" 2>/dev/null | cut -d= -f2)
+        [ -n "\$IDLE" ] && gsettings set org.gnome.desktop.session idle-delay "\$IDLE"
+        gsettings set org.gnome.desktop.screensaver lock-enabled "\${LOCK:-true}"
         ;;
     xset)
-        xset s "${delay}" "${delay}"
-        xset +dpms
-        xset dpms "${delay}" "$((delay + 60))" "$((delay + 120))"
+        XT=\$(grep '^xset_timeout=' "${SETTINGS_FILE}" 2>/dev/null | cut -d= -f2)
+        [ -n "\$XT" ] && { xset s "\$XT" "\$XT"; xset +dpms; }
         ;;
 esac
 
-echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Auto-lock RESTORED (delay: ${delay}s)" >> "${LOG_FILE}"
-notify-send "lockscreen" "Auto-lock restored. Idle timeout: 30 min" 2>/dev/null || true
-rm -f "${TIMER_FILE}"
+echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Timer expired. Session kept alive. Settings restored (system: ${system})" >> "${LOG_FILE}"
+notify-send "lockscreen" "Timer done. Settings restored." 2>/dev/null || true
+rm -f "${TIMER_FILE}" "${RESTORE_SCRIPT}"
 RESTORE_EOF
     chmod +x "$RESTORE_SCRIPT"
 }
@@ -184,13 +265,26 @@ show_status() {
         local pid
         pid=$(cat "$TIMER_FILE")
         if kill -0 "$pid" 2>/dev/null; then
-            echo "Status: DISABLED  (auto-lock is OFF, timer running — PID: $pid)"
+            echo "Timer      : RUNNING (PID: $pid)"
         else
-            echo "Status: UNKNOWN   (timer file exists but process not running)"
+            echo "Timer      : STALE (process gone)"
             rm -f "$TIMER_FILE"
         fi
     else
-        echo "Status: NORMAL    (auto-lock is active)"
+        echo "Timer      : none"
+    fi
+
+    if [ -f "$INHIBITOR_FILE" ]; then
+        local ipid
+        ipid=$(cat "$INHIBITOR_FILE")
+        if kill -0 "$ipid" 2>/dev/null; then
+            echo "Inhibitor  : RUNNING (PID: $ipid) — session protected"
+        else
+            echo "Inhibitor  : STALE (process gone)"
+            rm -f "$INHIBITOR_FILE"
+        fi
+    else
+        echo "Inhibitor  : none — session NOT protected"
     fi
 
     echo ""
@@ -212,14 +306,35 @@ show_status() {
     fi
 }
 
+# Dry run: print the plan without any side effects
+dry_run() {
+    local seconds="$1"
+    local system human
+    system=$(detect_lock_system)
+    human=$(human_time "$seconds")
+    local restore_time
+    restore_time=$(date -d "+${seconds} seconds" '+%H:%M' 2>/dev/null || echo "after $human")
+
+    echo "=== lockscreen dry-run: $human ==="
+    echo "Lock system : $system"
+    echo "Plan:"
+    echo "  1. Save current settings   ($SETTINGS_FILE)"
+    echo "  2. Start idle inhibitor    (systemd-inhibit --what=idle --mode=block sleep $seconds)"
+    echo "  3. Lock screen             (loginctl lock-session)"
+    echo "  4. Start timer             (PID -> $TIMER_FILE)"
+    echo "  5. After $human (~$restore_time): settings restored, session stays alive"
+    echo "(dry-run: nothing was executed)"
+}
+
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 if [ $# -eq 0 ]; then
     echo "Usage:"
-    echo "  lockscreen 6h       - disable auto-lock for 6 hours"
-    echo "  lockscreen 90m      - disable auto-lock for 90 minutes"
-    echo "  lockscreen off      - immediately restore auto-lock"
-    echo "  lockscreen status   - show current status"
+    echo "  lockscreen 6h          - lock screen now, keep session alive 6h"
+    echo "  lockscreen 90m         - lock screen now, keep session alive 90 min"
+    echo "  lockscreen off         - cancel timer, restore settings"
+    echo "  lockscreen status      - show current status"
+    echo "  lockscreen dry-run 6h  - show the plan without executing"
     exit 0
 fi
 
@@ -227,16 +342,29 @@ ARG="$1"
 
 case "$ARG" in
     off|OFF|restore|RESTORE)
-        echo "Restoring auto-lock..."
+        echo "Cancelling timer and restoring settings..."
         LOCK_SYSTEM=$(detect_lock_system)
         kill_existing_timer
-        enable_lock "$LOCK_SYSTEM" "$DEFAULT_IDLE_DELAY"
-        echo "✓ Done. Auto-lock restored (30 min idle timeout)."
-        notify-send "lockscreen" "Auto-lock restored." 2>/dev/null || true
+        restore_settings "$LOCK_SYSTEM"
+        echo "✓ Done. Timer cancelled, settings restored."
+        notify-send "lockscreen" "Timer cancelled. Settings restored." 2>/dev/null || true
         ;;
 
     status|STATUS)
         show_status
+        ;;
+
+    dry-run|DRY-RUN|--dry-run)
+        if [ -z "${2:-}" ]; then
+            echo "Usage: lockscreen dry-run 6h"
+            exit 1
+        fi
+        SECONDS_DURATION=$(parse_time "$2")
+        if [[ "$SECONDS_DURATION" == ERROR* ]]; then
+            echo "$SECONDS_DURATION"
+            exit 1
+        fi
+        dry_run "$SECONDS_DURATION"
         ;;
 
     *)
@@ -248,56 +376,51 @@ case "$ARG" in
         fi
 
         LOCK_SYSTEM=$(detect_lock_system)
-        CURRENT_DELAY=$(get_current_delay "$LOCK_SYSTEM")
 
-        # Kill any existing timer first
+        # Clean up any previous run
         kill_existing_timer
 
-        # Save current delay as restore target (fallback to 30 min)
-        if [ "$CURRENT_DELAY" -gt 0 ] 2>/dev/null; then
-            RESTORE_DELAY="$CURRENT_DELAY"
+        # 1. Save current settings for restore
+        save_settings "$LOCK_SYSTEM"
+
+        # 2. Start idle inhibitor (blocks logind auto-logout)
+        if start_inhibitor "$SECONDS_DURATION"; then
+            METHOD="inhibitor"
         else
-            RESTORE_DELAY="$DEFAULT_IDLE_DELAY"
+            METHOD="fallback"
+            disable_lock "$LOCK_SYSTEM"
         fi
 
-        # Disable auto-lock right now
-        disable_lock "$LOCK_SYSTEM"
+        # 3. Lock the screen now
+        lock_screen
 
-        # Create the restore script
-        create_restore_script "$LOCK_SYSTEM" "$RESTORE_DELAY"
-
-        # Start background timer
+        # 4. Start background restore timer
+        create_restore_script "$LOCK_SYSTEM"
         (
             sleep "$SECONDS_DURATION"
             bash "$RESTORE_SCRIPT"
-        ) &
+        ) >/dev/null 2>&1 &
         TIMER_PID=$!
         echo "$TIMER_PID" > "$TIMER_FILE"
         disown "$TIMER_PID"
 
-        # Human-readable duration
-        if [ "$SECONDS_DURATION" -ge 3600 ]; then
-            H=$((SECONDS_DURATION / 3600))
-            M=$((SECONDS_DURATION % 3600 / 60))
-            if [ "$M" -gt 0 ]; then
-                HUMAN_TIME="${H}h ${M}m"
-            else
-                HUMAN_TIME="${H}h"
-            fi
-        else
-            HUMAN_TIME="$((SECONDS_DURATION / 60))m"
-        fi
-
+        # 5. Report
+        HUMAN_TIME=$(human_time "$SECONDS_DURATION")
         RESTORE_TIME=$(date -d "+${SECONDS_DURATION} seconds" '+%H:%M' 2>/dev/null || echo "after $HUMAN_TIME")
 
-        echo "✓ Auto-lock DISABLED for $HUMAN_TIME"
+        echo ""
+        echo "✓ Locked. Session kept alive for $HUMAN_TIME"
         echo "  Restores at  : $RESTORE_TIME"
         echo "  Lock system  : $LOCK_SYSTEM"
+        echo "  Method       : $METHOD"
+        if [ "$METHOD" = "inhibitor" ]; then
+            echo "  Inhibitor PID: $(cat "$INHIBITOR_FILE")"
+        fi
         echo "  Timer PID    : $TIMER_PID"
         echo ""
         echo "  To cancel early: lockscreen off"
 
-        notify-send "lockscreen" "Auto-lock disabled for $HUMAN_TIME. Restores at $RESTORE_TIME." 2>/dev/null || true
-        log "Disabled for ${SECONDS_DURATION}s (restores at $RESTORE_TIME), PID: $TIMER_PID"
+        notify-send "lockscreen" "Locked. Session kept alive for $HUMAN_TIME." 2>/dev/null || true
+        log "Locked, session kept alive for ${SECONDS_DURATION}s (restores at $RESTORE_TIME), method: $METHOD, timer PID: $TIMER_PID"
         ;;
 esac

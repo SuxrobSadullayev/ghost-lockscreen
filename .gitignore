@@ -1,4 +1,7 @@
 # Personal log files (generated at runtime)
 *.log
 .lockscreen_timer
+.lockscreen_inhibitor_pid
+.lockscreen_settings
 .lockscreen_restore.sh
+lockscreen_diagnose.txt

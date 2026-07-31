@@ -1,14 +1,33 @@
-# 🔒 lockscreen — School21 Auto-Lock Bypass Tool
+# 🔒 lockscreen — School21 Session Keep-Alive Tool
 
-> School21 kompyuterlarida shaxsiy akkountingiz avtomatik chiqarib yuborilmasligi uchun CLI tool.
+> School21 kompyuterlarida akkountingiz avtomatik chiqarib yuborilmasligi uchun: ekranni qulflaydi va sessiyani N soat tirik ushlab turadi.
 
 ---
 
 ## Muammo nima?
 
-School21 kompyuterlarida har bir akkount **30 daqiqa** faolsizlikdan so'ng avtomatik ravishda lock bo'lib, foydalanuvchi tizimdan chiqarib yuboriladi. Agar siz uzoqroq vaqt ish bilan band bo'lsangiz (masalan, compile kutayotgan bo'lsangiz, yoki bir joyga ketib kelishingiz kerak bo'lsa), akkountingiz sessiyan yo'qoladi.
+School21 kompyuterlarida har bir akkount **30 daqiqa** faolsizlikdan so'ng avtomatik chiqarib yuboriladi (systemd-logind `IdleActionSec` orqali). Oddiy ekran bloklash (Super+L) yordam bermaydi — **qulflangan ekran ham tizim uchun "idle" hisoblanadi**, shuning uchun siz uzoq vaqt ketganingizda sessiya o'chib qoladi.
 
-Bu tool o'sha muammoni hal qiladi.
+Bu tool muammoni hal qiladi: ekranni qulflaydi **VA** sessiyani belgilangan vaqtgacha o'chishdan himoya qiladi.
+
+---
+
+## Tezkor o'rnatish (School21, 1 daqiqa)
+
+```bash
+git clone https://github.com/SuxrobSadullayev/ghost-lockscreen.git
+cd ghost-lockscreen
+./diagnose.sh            # (ixtiyoriy) muhit tekshiruvi — INHIBIT_OK muhim
+./install.sh             # ~/.local/bin ga o'rnatadi
+source ~/.bashrc         # PATH yangilanadi
+lockscreen status        # ishlayotganini tekshiring
+```
+
+So'ng har safar ketishdan oldin:
+
+```bash
+lockscreen 8h            # ekran qulflanadi, sessiya 8 soat himoyalanadi
+```
 
 ---
 
@@ -18,25 +37,25 @@ Bu tool o'sha muammoni hal qiladi.
 ┌─────────────────────────────────────────────────────┐
 │  lockscreen 6h                                      │
 │                                                     │
-│  1. GNOME idle-delay → 0  (lock o'chadi)            │
-│  2. Fon timer → sleep 21600s                        │
-│  3. 6 soat o'tgach → sozlamalar qaytariladi         │
-│  4. Auto-lock yana 30 daqiqaga qaytadi              │
+│  1. Joriy sozlamalar saqlanadi                      │
+│  2. Idle inhibitor ishga tushadi (systemd-inhibit)  │
+│     → logind sessiyani "idle" deb bilmaydi          │
+│  3. Ekran shu zahoti qulflanadi                     │
+│  4. Fon timer → sleep 21600s                        │
+│  5. 6 soat o'tgach → sozlamalar qaytariladi         │
+│  6. Sessiya o'chmaydi, siz qaytib parol yozasiz     │
 └─────────────────────────────────────────────────────┘
 ```
 
 ### Ichki mexanizm — qadamma-qadam
 
 1. **`lockscreen Nh` yoziladi** — script ishga tushadi
-2. **Lock tizimi aniqlanadi** — GNOME yoki xset borligini tekshiradi
-3. **Joriy sozlamalar saqlanadi** — asl idle-delay qaytarish uchun yodda tutiladi
-4. **Auto-lock o'chiriladi:**
-   - GNOME: `gsettings set org.gnome.desktop.session idle-delay 0`
-   - GNOME: `gsettings set org.gnome.desktop.screensaver lock-enabled false`
-   - xset: `xset s off` va `xset -dpms`
-5. **Fon jarayoni (timer) ishga tushadi** — `sleep N` orqali kutadi, `disown` bilan terminaldan ajratiladi
-6. **Timer tugagach** — `~/.lockscreen_restore.sh` ishga tushadi va barcha sozlamalar avvalgi holatga qaytariladi
-7. **Bildirishnoma keladi** — `notify-send` orqali ekranda xabar ko'rinadi
+2. **Joriy sozlamalar saqlanadi** — `~/.lockscreen_settings` fayliga (idle-delay, lock-enabled, xset timeout) — keyin qaytarish uchun
+3. **Idle inhibitor ishga tushadi** — `systemd-inhibit --what=idle --mode=block sleep N` fon jarayoni sifatida. Bu logind'ga "session idle emas" deb aytadi — **30 daqiqalik avto-logout ishga tushmaydi**. Root huquqi kerak emas
+4. **Ekran qulflanadi** — `loginctl lock-session` (Wayland/GNOME), kerak bo'lsa `gdbus`/`gnome-screensaver-command` fallback
+5. **Fon timer** — `sleep N` + `disown`, terminal yopilsa ham ishlaydi
+6. **Timer tugagach** — inhibitor o'zi tugaydi, sozlamalar avvalgi holatga qaytariladi, `notify-send` xabar beradi
+7. **Siz qaytgach** — parol yozib ekranni ochasiz, sessiyangiz o'chmagan bo'ladi
 
 ### Fayllar
 
@@ -44,6 +63,8 @@ Bu tool o'sha muammoni hal qiladi.
 |---|---|---|
 | `lockscreen` | `~/.local/bin/lockscreen` | Asosiy executable script |
 | `.lockscreen_timer` | `~/.lockscreen_timer` | Timer jarayonining PID i |
+| `.lockscreen_inhibitor_pid` | `~/.lockscreen_inhibitor_pid` | Inhibitor jarayonining PID i |
+| `.lockscreen_settings` | `~/.lockscreen_settings` | Saqlangan sozlamalar (qaytarish uchun) |
 | `.lockscreen_restore.sh` | `~/.lockscreen_restore.sh` | Vaqt tugaganda ishlaydigan restore script |
 | `.lockscreen.log` | `~/.lockscreen.log` | Barcha amallar logi |
 
@@ -58,14 +79,28 @@ git clone https://github.com/SuxrobSadullayev/ghost-lockscreen.git
 cd ghost-lockscreen
 ```
 
-### 2. Installerni ishga tushiring
+### 2. Diagnostika (ixtiyoriy, lekin tavsiya etiladi)
+
+Tool ishlashiga ishonch hosil qilish uchun School21'da birinchi bo'lib tekshiruvni yugurtiring:
+
+```bash
+./diagnose.sh
+```
+
+Bu script muhitni, logind sozlamalarini, dconf lock'larini va inhibitor huquqini tekshiradi. Natija `~/lockscreen_diagnose.txt` ga yoziladi. Muhim qatorlar:
+
+- `INHIBIT_OK` — yechim ishlaydi
+- `IdleActionSec=30min` + `IdleAction=logout/lock` — logout mezanizmi logind ekanini tasdiqlaydi
+- `INHIBIT_FAILED` — systemd-inhibit bloklangan, fallback rejim ishlaydi (lekin qulflangan sessiyani himoya qilmaydi)
+
+### 3. Installerni ishga tushiring
 
 ```bash
 chmod +x install.sh
 ./install.sh
 ```
 
-### 3. PATH ni yangilang
+### 4. PATH ni yangilang
 
 ```bash
 source ~/.bashrc
@@ -73,13 +108,33 @@ source ~/.bashrc
 source ~/.zshrc
 ```
 
-### 4. Ishlashini tekshiring
+### 5. Ishlashini tekshiring
 
 ```bash
 lockscreen status
+lockscreen dry-run 6h   # hech narsa qilmaydi, faqat rejani ko'rsatadi
 ```
 
 > **Eslatma:** `install.sh` faqat **bir marta** ishga tushiriladi. Keyingi sessiyalarda to'g'ridan-to'g'ri `lockscreen` buyrug'ini ishlatasiz.
+
+---
+
+## Laptopda o'rnatish (har qanday GNOME Linux)
+
+Tool universaldir — o'z laptopingizda ham xuddi shu tarzda ishlaydi:
+
+```bash
+git clone https://github.com/SuxrobSadullayev/ghost-lockscreen.git
+cd ghost-lockscreen
+./install.sh          # ~/.local/bin ga o'rnatadi
+source ~/.bashrc
+lockscreen status     # tekshirish
+lockscreen dry-run 6h # rejani ko'rsatadi (hech narsa qilmaydi)
+```
+
+Laptopda ham `lockscreen 6h` yozsangiz ekran qulflanadi va sessiya 6 soat himoyalanadi. School21'da ishlatishdan oldin laptopda **sinab ko'rish mumkin**: `lockscreen 5s` yozing — ekran qulflanadi, 5 soniyadan keyin timer tugaydi, parol bilan ochasiz.
+
+> **Muhim:** `lockscreen` buyrug'i ekranni qulflaydi — terminalda yozganingizdan keyin ekran yopiladi, shuning uchun uni faqat ketishdan oldin ishlating. Test uchun `dry-run` yoki juda qisqa vaqt (masalan `lockscreen 1m`) ishlating.
 
 ---
 
@@ -88,14 +143,14 @@ lockscreen status
 ### Asosiy buyruqlar
 
 ```bash
-lockscreen 6h        # 6 soat
+lockscreen 6h        # ekranni qulflaydi, sessiyani 6 soat himoya qiladi
 lockscreen 10h       # 10 soat
 lockscreen 30m       # 30 daqiqa
 lockscreen 90m       # 1 soat 30 daqiqa
-lockscreen 150m      # 2 soat 30 daqiqa
 lockscreen 8h        # 8 soat (to'liq ish kuni)
-lockscreen off       # Vaqtidan oldin qaytarish
+lockscreen off       # Vaqtidan oldin bekor qilish (sozlamalarni qaytaradi)
 lockscreen status    # Joriy holatni ko'rish
+lockscreen dry-run 6h # Rejani ko'rsatadi, hech narsa qilmaydi
 ```
 
 ### Vaqt formatlari
@@ -111,15 +166,15 @@ lockscreen status    # Joriy holatni ko'rish
 ```
 === lockscreen status ===
 Lock system: gnome
-Status: DISABLED  (auto-lock is OFF, timer running — PID: 12345)
+Timer      : RUNNING (PID: 12345)
+Inhibitor  : RUNNING (PID: 54321) — session protected
 
 Current settings:
   idle-delay   : uint32 0
   lock-enabled : false
 
 Last 5 log entries:
-[2025-01-15 09:00:01] Auto-lock DISABLED (system: gnome)
-[2025-01-15 09:00:01] Disabled for 36000s (restores at 19:00), PID: 12345
+[2026-01-15 09:00:01] Locked, session kept alive for 21600s (restores at 15:00), method: inhibitor, timer PID: 12345
 ```
 
 ---
@@ -127,21 +182,30 @@ Last 5 log entries:
 ## Ish oqimi (misol)
 
 ```bash
-# Ertalab School21 ga keldingiz, ish boshladingiz
+# Ertalab School21 ga keldingiz, ketishdan oldin:
 lockscreen 8h
-# ✓ Auto-lock DISABLED for 8h
-# Restores at : 18:00
-# Lock system : gnome
-# Timer PID   : 9821
+# ✓ Locked. Session kept alive for 8h
+#   Restores at  : 18:00
+#   Lock system  : gnome
+#   Method       : inhibitor
+#   Inhibitor PID: 9821
 #
-# To cancel early: lockscreen off
+#   To cancel early: lockscreen off
+# (ekran shu zahoti qulflanadi — siz ketishingiz mumkin)
 
-# ... 8 soat ishlaysiz, tizim sizni chiqarmaydi ...
+# ... 8 soat o'tgach qaytasiz:
+# Parol yozasiz — sessiya hali tirik, hamma narsa joyida
 
-# Kechqurun ketishdan oldin (ixtiyoriy — o'zi qaytadi)
+# Vaqtidan oldin bekor qilish (ixtiyoriy):
 lockscreen off
-# ✓ Done. Auto-lock restored (30 min idle timeout).
+# ✓ Done. Timer cancelled, settings restored.
 ```
+
+---
+
+## Fallback rejim
+
+Agar `systemd-inhibit` mavjud bo'lmasa, tool avtomatik eski usulga o'tadi (GNOME idle-delay 0 + xset o'chirish). Bu rejim ekran ochiq turganda ishlaydi, lekin **qulflangan sessiyani himoya qilmaydi** — diagnostika `INHIBIT_OK` ko'rsatsa ham, tavsiya inhibitor rejim.
 
 ---
 
@@ -153,10 +217,13 @@ lockscreen off
 cat ~/.lockscreen.log
 ```
 
-### Agar tool ishlamay qolsa
+### Agar tool ishlamay qolsa — qo'lda qaytarish
 
 ```bash
-# Qo'lda sozlamalarni qaytarish (GNOME uchun)
+# Timer/inhibitor fayllarini tozalash
+rm -f ~/.lockscreen_timer ~/.lockscreen_inhibitor_pid ~/.lockscreen_restore.sh
+
+# GNOME sozlamalarini qaytarish
 gsettings set org.gnome.desktop.session idle-delay 1800
 gsettings set org.gnome.desktop.screensaver lock-enabled true
 
@@ -165,11 +232,20 @@ xset s 1800 1800
 xset +dpms
 ```
 
-### Timer jarayonini tekshirish
+### Jarayonlarni tekshirish
 
 ```bash
-cat ~/.lockscreen_timer        # PID ni ko'rish
-ps aux | grep $(cat ~/.lockscreen_timer)  # jarayon ishlayaptimi
+cat ~/.lockscreen_timer         # timer PID
+cat ~/.lockscreen_inhibitor_pid # inhibitor PID
+ps aux | grep -E "systemd-inhibit|lockscreen" | grep -v grep
+```
+
+---
+
+## Testlar
+
+```bash
+bash tests/test_lockscreen.sh   # 21 ta test, hech qanday real ta'sirsiz (stub'lar bilan)
 ```
 
 ---
@@ -178,8 +254,9 @@ ps aux | grep $(cat ~/.lockscreen_timer)  # jarayon ishlayaptimi
 
 - Linux (Ubuntu/Debian) — School21 kompyuterlari
 - Bash 4+
-- GNOME Desktop yoki xset mavjud bo'lsa ishlaydi
-- Alohida o'rnatish talab qilinmaydi (`gsettings` va `xset` o'rnatilgan bo'ladi)
+- GNOME Desktop (gsettings) yoki xset
+- `systemd-inhibit` (systemd paketi, odatda oldindan o'rnatilgan)
+- Alohida o'rnatish talab qilinmaydi
 
 ---
 
@@ -187,7 +264,10 @@ ps aux | grep $(cat ~/.lockscreen_timer)  # jarayon ishlayaptimi
 
 ```
 ghost-lockscreen/
-├── lockscreen      # Asosiy script
-├── install.sh      # Bir martalik o'rnatuvchi
-└── README.md       # Ushbu fayl
+├── lockscreen            # Asosiy script
+├── diagnose.sh           # School21 muhit diagnostikasi
+├── install.sh            # Bir martalik o'rnatuvchi
+├── tests/
+│   └── test_lockscreen.sh # Testlar (stub'lar bilan)
+└── README.md             # Ushbu fayl
 ```
