@@ -207,6 +207,22 @@ lockscreen off
 
 Agar `systemd-inhibit` mavjud bo'lmasa, tool avtomatik eski usulga o'tadi (GNOME idle-delay 0 + xset o'chirish). Bu rejim ekran ochiq turganda ishlaydi, lekin **qulflangan sessiyani himoya qilmaydi** — diagnostika `INHIBIT_OK` ko'rsatsa ham, tavsiya inhibitor rejim.
 
+> **`INHIBIT_FAILED` kuzatilsa:** `systemd-inhibit` "Action ... is not registered" deb xato bersa, polkit `login1` action'larini o'qiy olmayapti. Tekshiring:
+> ```bash
+> stat -c "%A %U:%G %n" /usr/share/polkit-1/actions/org.freedesktop.login1.policy
+> # to'g'ri holat: -rw-r--r--  (644); noto'g'ri: -rw-r----- (640)
+> ```
+> Noto'g'ri bo'lsa: `sudo chmod 644 ... && sudo systemctl restart polkit`
+
+---
+
+## KDE Plasma qo'llab-quvvatlashi
+
+Tool GNOME bilan birga **KDE Plasma (5.x)** da ham ishlaydi:
+- Desktop avtomatik aniqlanadi (`XDG_CURRENT_DESKTOP=KDE` → `Lock system: kde`)
+- Ekran qulflash: `loginctl lock-session` (KDE kscreenlocker bilan integratsiyalangan), zaxira sifatida `org.freedesktop.ScreenSaver` DBus
+- Fallback rejimda KDE auto-lock (`kscreenlockerrc Autolock`) va X11 screensaver (`xset`) o'chirilib, timer tugagach avvalgi holatiga qaytariladi
+
 ---
 
 ## Qo'shimcha

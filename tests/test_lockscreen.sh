@@ -20,6 +20,10 @@ export DISPLAY=":0"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/99999/bus"
 export STUB_LOG="$TEST_DIR/stub.log"
 
+# Tests simulate a GNOME system (gsettings stubs); make sure the host's
+# desktop env vars do not leak in and flip detection to "kde".
+unset XDG_CURRENT_DESKTOP KDE_FULL_SESSION
+
 PASS=0
 FAIL=0
 

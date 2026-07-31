@@ -78,7 +78,9 @@ ensure_display() {
 # Detect which screen lock system is in use
 detect_lock_system() {
     ensure_display
-    if command -v gsettings &>/dev/null && gsettings get org.gnome.desktop.session idle-delay &>/dev/null 2>&1; then
+    if [ "${XDG_CURRENT_DESKTOP:-}" = "KDE" ] || [ "${KDE_FULL_SESSION:-}" = "true" ]; then
+        echo "kde"
+    elif command -v gsettings &>/dev/null && gsettings get org.gnome.desktop.session idle-delay &>/dev/null 2>&1; then
         echo "gnome"
     elif command -v xset &>/dev/null; then
         echo "xset"
@@ -112,6 +114,13 @@ save_settings() {
             echo "idle_delay=$(get_current_delay gnome)" >> "$SETTINGS_FILE"
             echo "lock_enabled=$(gsettings get org.gnome.desktop.screensaver lock-enabled 2>/dev/null | tr -d "'" || echo true)" >> "$SETTINGS_FILE"
             ;;
+        kde)
+            echo "xset_timeout=$(get_current_delay xset)" >> "$SETTINGS_FILE"
+            local kautolock
+            kautolock=$(kreadconfig5 --file kscreenlockerrc --group Daemon --key Autolock 2>/dev/null)
+            [ -z "$kautolock" ] && kautolock="true"
+            echo "kde_autolock=$kautolock" >> "$SETTINGS_FILE"
+            ;;
         xset)
             echo "xset_timeout=$(get_current_delay xset)" >> "$SETTINGS_FILE"
             ;;
@@ -123,14 +132,19 @@ save_settings() {
 restore_settings() {
     local system="$1"
     [ -f "$SETTINGS_FILE" ] || return 0
-    local idle_delay lock_enabled xset_timeout
+    local idle_delay lock_enabled xset_timeout kde_autolock
     idle_delay=$(grep '^idle_delay=' "$SETTINGS_FILE" | cut -d= -f2)
     lock_enabled=$(grep '^lock_enabled=' "$SETTINGS_FILE" | cut -d= -f2)
     xset_timeout=$(grep '^xset_timeout=' "$SETTINGS_FILE" | cut -d= -f2)
+    kde_autolock=$(grep '^kde_autolock=' "$SETTINGS_FILE" | cut -d= -f2)
     case "$system" in
         gnome)
             [ -n "$idle_delay" ] && gsettings set org.gnome.desktop.session idle-delay "$idle_delay"
             gsettings set org.gnome.desktop.screensaver lock-enabled "${lock_enabled:-true}"
+            ;;
+        kde)
+            [ -n "$xset_timeout" ] && { xset s "$xset_timeout" "$xset_timeout"; xset +dpms; }
+            [ -n "$kde_autolock" ] && kwriteconfig5 --file kscreenlockerrc --group Daemon --key Autolock "$kde_autolock" 2>/dev/null
             ;;
         xset)
             [ -n "$xset_timeout" ] && { xset s "$xset_timeout" "$xset_timeout"; xset +dpms; }
@@ -149,6 +163,12 @@ disable_lock() {
             gsettings set org.gnome.desktop.screensaver lock-enabled false
             gsettings set org.gnome.settings-daemon.plugins.power sleep-display-ac 0 2>/dev/null || true
             gsettings set org.gnome.settings-daemon.plugins.power sleep-display-battery 0 2>/dev/null || true
+            ;;
+        kde)
+            xset s off
+            xset -dpms
+            xset s 0 0
+            kwriteconfig5 --file kscreenlockerrc --group Daemon --key Autolock false 2>/dev/null
             ;;
         xset)
             xset s off
@@ -173,7 +193,14 @@ start_inhibitor() {
         return 1
     fi
     nohup systemd-inhibit --what=idle --mode=block --why="lockscreen timer" sleep "$seconds" >/dev/null 2>&1 &
-    echo $! > "$INHIBITOR_FILE"
+    local pid=$!
+    sleep 0.3
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "WARNING: systemd-inhibit failed to register (process exited immediately)."
+        echo "  Session will NOT be protected. Locking screen anyway."
+        return 1
+    fi
+    echo "$pid" > "$INHIBITOR_FILE"
     log "Idle inhibitor started (PID: $(cat "$INHIBITOR_FILE"))"
     return 0
 }
@@ -182,9 +209,16 @@ start_inhibitor() {
 lock_screen() {
     ensure_display
     local sid
+    # Session column layout varies across systemd versions — try several layouts
     sid=$(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$USER" '$3==u && $6=="user" {print $1; exit}')
+    [ -z "$sid" ] && sid=$(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$USER" '$3==u {print $1; exit}')
+    [ -z "$sid" ] && sid=$(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$(id -u)" '$2==u {print $1; exit}')
     if [ -n "$sid" ] && loginctl lock-session "$sid" 2>/dev/null; then
         echo "Screen locked (loginctl, session: $sid)"
+        return 0
+    fi
+    if command -v gdbus &>/dev/null && gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver --method org.freedesktop.ScreenSaver.Lock &>/dev/null; then
+        echo "Screen locked (gdbus org.freedesktop.ScreenSaver)"
         return 0
     fi
     if command -v gdbus &>/dev/null && gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.Lock &>/dev/null; then
@@ -240,6 +274,12 @@ case "${system}" in
         [ -n "\$IDLE" ] && gsettings set org.gnome.desktop.session idle-delay "\$IDLE"
         gsettings set org.gnome.desktop.screensaver lock-enabled "\${LOCK:-true}"
         ;;
+    kde)
+        XT=\$(grep '^xset_timeout=' "${SETTINGS_FILE}" 2>/dev/null | cut -d= -f2)
+        KA=\$(grep '^kde_autolock=' "${SETTINGS_FILE}" 2>/dev/null | cut -d= -f2)
+        [ -n "\$XT" ] && { xset s "\$XT" "\$XT"; xset +dpms; }
+        [ -n "\$KA" ] && kwriteconfig5 --file kscreenlockerrc --group Daemon --key Autolock "\$KA"
+        ;;
     xset)
         XT=\$(grep '^xset_timeout=' "${SETTINGS_FILE}" 2>/dev/null | cut -d= -f2)
         [ -n "\$XT" ] && { xset s "\$XT" "\$XT"; xset +dpms; }
@@ -293,6 +333,10 @@ show_status() {
         gnome)
             echo "  idle-delay   : $(gsettings get org.gnome.desktop.session idle-delay 2>/dev/null)"
             echo "  lock-enabled : $(gsettings get org.gnome.desktop.screensaver lock-enabled 2>/dev/null)"
+            ;;
+        kde)
+            echo "  autolock     : $(kreadconfig5 --file kscreenlockerrc --group Daemon --key Autolock 2>/dev/null || echo 'default(true)')"
+            xset q 2>/dev/null | grep -A3 "Screen Saver" || echo "  xset info unavailable"
             ;;
         xset)
             xset q 2>/dev/null | grep -A3 "Screen Saver" || echo "  xset info unavailable"
